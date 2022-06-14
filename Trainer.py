@@ -2,6 +2,9 @@ import torch
 from tqdm import tqdm
 import os
 import shutil
+from torch.cuda.amp import autocast
+from torch.cuda.amp import GradScaler
+import cloudpickle
 
 def save_checkpoint(state, epoch, val_acc, is_best, checkpoint):
     filepath = os.path.join(checkpoint, f"food_weight-{epoch:02d}-{val_acc:.2f}.pth.tar")
@@ -9,9 +12,25 @@ def save_checkpoint(state, epoch, val_acc, is_best, checkpoint):
         print("Checkpoint Directory does not exist! Making directory {}".format(checkpoint))
         os.makedirs(checkpoint, exist_ok=True)
     
+    # base
     torch.save(state, filepath)
+    # jit save
+    # model_scripts = torch.jit.script(model)
+    # model_scripts.save(filepath)
+
+    # cloudpicke
+    print(f"Saved Model Weight Type: {next(model.parameters()).device}")
+    
+    with open(model_filepath, "wb") as f:
+        cloudpickle.dump(model, f)
+    if is_best:
+        with open(best_filepath, "wb") as f:
+            cloudpickle.dump(model, f)
+
     if is_best:
         shutil.copyfile(filepath, os.path.join(checkpoint, "best.pth.tar"))
+   
+
 
 def val(val_loader,model, criterion, device,epoch,max_epoch):
     model.eval()
@@ -66,6 +85,9 @@ def train(train_loader,model,device,optimizer,criterion,epoch,max_epoch):
             "loss": 0,
             "acc": 0
         }
+    
+    scaler = GradScaler()
+
     with tqdm(train_loader) as t:
         t.set_description(f'[{epoch+1}/{max_epoch}]')
         for i,data in enumerate(t) :
@@ -74,12 +96,14 @@ def train(train_loader,model,device,optimizer,criterion,epoch,max_epoch):
             labels_batch = labels_batch.to(device) 
             # 변화도(Gradient) 매개변수를 0으로 만들고
             optimizer.zero_grad()
-
+            with autocast():
             # 순전파 + 역전파 + 최적화를 한 후
-            outputs = model(train_batch)
-            loss = criterion(outputs, labels_batch)
-            loss.backward()
-            optimizer.step()
+                outputs = model(train_batch)
+                loss = criterion(outputs, labels_batch)
+                
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             # 통계를 출력합니다.
             summ["loss"] += loss.item()
