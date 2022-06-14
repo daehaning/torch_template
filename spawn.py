@@ -53,24 +53,23 @@ def main(args):
         wandb.init(project=args["project"],notes="baseline")
         wandb.config.update(args)
         
-    ngpus_per_node = torch.cuda.device_count()
     if len(args['gpus'])>1:
-        device = select_device(args['gpus'],args["batch_size"])
+        gpu = select_device(args['gpus'],args["batch_size"])
     else:
-        device = torch.device('cuda:'+args['gpus'])
+        gpu = torch.device('cuda:'+args['gpus'])
     
-    print(device)
-
-    # mp.spawn(main_worker,nprocs=ngpus_per_node,args={ngpus_per_node})
+    ngpus_per_node = torch.cuda.device_count()
+    
+    mp.spawn(main_worker,nprocs=ngpus_per_node,args=(ngpus_per_node,args))
 
 def main_worker(gpu, ngpus_per_node):
-
-    logger = logging.getLogger("train")
-    logger.setLevel(level=logging.INFO)
+    if (ngpus_per_node == 1) or (ngpus_per_node > 1  and gpu == 0):
+        logger = logging.getLogger("train")
+        logger.setLevel(level=logging.INFO)
 
     # prepare for (multi-device) GPU training
     if ngpus_per_node > 1:
-        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
+        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo",init_method="tcp://127.0.0.1:3333", world_size=ngpus_per_node, rank=gpu)
 
     transforms_train = transforms.Compose([
     transforms.Resize((args["img_size"], args["img_size"])),
@@ -84,24 +83,26 @@ def main_worker(gpu, ngpus_per_node):
     ])
 
     train_set = torchvision.datasets.ImageFolder(root=args["srcDir"]+'train',transform=transforms_train)
-    train_sampler = DistributedSampler(train_set,shuffle=True)
+    if ngpus_per_node > 1:
+        train_sampler = DistributedSampler(train_set,shuffle=True)
+    else:
+        train_sampler = None
     train_loader = DataLoader(train_set, batch_size=args["batch_size"], num_workers=args["num_workers"], shuffle=False, drop_last=True,sampler=train_sampler)
 
     # Process 0
     val_set = torchvision.datasets.ImageFolder(root=args["srcDir"]+'val',transform=transforms_val)
     val_loader = DataLoader(val_set, batch_size=args["batch_size"], num_workers=args["num_workers"], shuffle=False, drop_last=True)
     
-    logger.info("Data Ready!")
-
-    
     # # build model architecture, then print to console
     model = Model(args["model"], num_classes=len(train_set.classes))
     # raise RuntimeError("!!!!")
+    if (ngpus_per_node == 1) or (ngpus_per_node > 1  and gpu == 0):
+        logger.info("Data Ready!")
+        logger.info(model)
+        wandb.watch(model)
 
-    logger.info(model)
-    wandb.watch(model)
-
-    if args['gpus'] and RANK != -1:
+    if ngpus_per_node > 1:
+        model = model.to(gpu)
         model = DDP(model, device_ids=[gpu], output_device=gpu,find_unused_parameters=True)
 
     # build optimizer, learning rate scheduler. delete every lines containing lr_scheduler for disabling scheduler
@@ -117,21 +118,24 @@ def main_worker(gpu, ngpus_per_node):
         metrics_summary.update(val(val_loader,model,criterion,gpu,epoch,args["epochs"]))
         is_best_loss = metrics_summary["val_loss"] < best_val_loss
         is_best_acc = metrics_summary["val_acc"] > best_val_acc
-        save_checkpoint(
-                    {"state_dict": model.state_dict()},
-                    epoch = epoch + 1,
-                    val_acc = metrics_summary['val_acc'],
-                    # "optimizer": optimizer.state_dict(),
-                    is_best=is_best_loss,
-                    checkpoint=f'{args["saveDir"]}_{len(train_set.classes)}')
+        if (ngpus_per_node == 1) or (ngpus_per_node > 1  and gpu == 0):
+            save_checkpoint(
+                        {"state_dict": model.state_dict()},
+                        epoch = epoch + 1,
+                        val_acc = metrics_summary['val_acc'],
+                        # "optimizer": optimizer.state_dict(),
+                        is_best=is_best_loss,
+                        checkpoint=f'{args["saveDir"]}_{len(train_set.classes)}')
 
-        wandb.log({
-                        "epoch" : epoch,
-                        "acc" : metrics_summary["acc"],
-                        "loss" : metrics_summary["loss"],
-                        "val_acc" : metrics_summary["val_acc"],
-                        "val_loss" : metrics_summary["val_loss"],
-                    })
+            wandb.log({
+                            "epoch" : epoch,
+                            "acc" : metrics_summary["acc"],
+                            "loss" : metrics_summary["loss"],
+                            "val_acc" : metrics_summary["val_acc"],
+                            "val_loss" : metrics_summary["val_loss"],
+                        })
+    if (ngpus_per_node == 1) or (ngpus_per_node > 1  and gpu == 0):
+        wandb.finish()
         logger.info("Finish")
 
 if __name__ == '__main__':
